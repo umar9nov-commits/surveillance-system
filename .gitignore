@@ -1,0 +1,42 @@
+# Generated files
+**/build/
+**/install/
+**/log/
+**/logs/
+**/demo_logs/
+**/.dart_tool/
+**/__pycache__/
+**/.venv*/
+**/venv/
+**/node_modules/
+**/.idea/
+*.pyc
+*.pyo
+*.log
+*.iml
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Backups and runtime state
+**/*backup*/
+**/*.bak*
+**/patrol_progress.json
+
+# Flutter generated platform files
+**/ephemeral/
+**/.plugin_symlinks/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+*.pdb
+
+# Additional local credentials
+*.pfx
+*.p12
+*.jks
+*.keystore
+**/key.properties

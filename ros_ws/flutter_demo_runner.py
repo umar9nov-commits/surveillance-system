@@ -1,0 +1,430 @@
+"""One selected simulation demo, with owned startup and shutdown."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+from flutter_demo_runtime import Cancelled, ProcessTree, RosProbe
+
+ROOT = Path.home() / 'surveillance_ws'
+PREFIX = '@@SURVEILLANCE_DEMO@@'
+
+
+def run_session(host, mode):
+    """Only orchestration: camera labels still come from the existing monitor."""
+    if mode not in ('standing', 'walking', 'running'):
+        raise ValueError('Unknown simulation mode')
+    host.preflight()
+    host.stage('starting', 'Starting ' + mode + ' simulation')
+    host.start('simulation', ['bash', str(host.root / 'start_flutter_simulation.sh'),
+                             '--' + mode, '--gui', '--rviz', '--viewer'])
+    host.wait_navigation()
+    host.start('rosbridge', ['ros2', 'launch', 'rosbridge_server',
+                            'rosbridge_websocket_launch.xml'])
+    host.wait_connection()
+    host.stage('connection_ready', 'ROS connection ready; preparing patrol')
+    if mode == 'standing':
+        host.start('observation', ['/usr/bin/python3', '-u',
+                                  str(host.root / 'pose_observation_bridge.py'), '--execute'])
+        host.wait_marker('observation_armed', 20)
+        host.wait_node('pose_observation_bridge')
+    host.start('decision', ['/usr/bin/python3', '-u', str(host.root / 'pose_decision_preview.py')])
+    host.wait_marker('decision_ready', 20)
+    host.wait_node('pose_decision_preview')
+    host.enable_patrol()
+    host.start('patrol', ['/usr/bin/python3', '-u', str(host.root / 'patrol_once.py')])
+    host.wait_marker('patrol_goal', 25)
+    host.check_checkpoint(complete=False)
+    host.start('monitor', [str(host.root / '.venv_yolo/bin/python'), '-u',
+                           str(host.root / 'live_pose_monitor.py'), '--seconds', '3600'])
+    host.wait_marker('monitor_ready', 120)
+    host.wait_publishers()
+    host.stage('patrolling', 'Patrol started; external-camera detection is active')
+    host.watch(mode)
+
+
+def managed_session(host, mode):
+    try:
+        run_session(host, mode)
+    finally:
+        host.shutdown()
+
+
+class DemoHost:
+    def __init__(self, mode, root=ROOT):
+        self.root = root
+        self.mode = mode
+        self.stop = threading.Event()
+        self.processes = {}
+        self.trees = {}
+        self.readers = []
+        self.markers = set()
+        self.errors = {}
+        self.lock = threading.RLock()
+        self.probe = None
+        self.controller_owned = False
+        self.patrol_start_clock = None
+        self.shutdown_started = False
+        self.connection_ready = False
+        self.last_tree_refresh = 0.0
+        log_dir = root / 'demo_logs'
+        log_dir.mkdir(exist_ok=True)
+        self.logfile = (log_dir / ('flutter_' + mode + '_' + time.strftime('%Y%m%d_%H%M%S') + '.log')).open('a')
+        self.session_lock = (log_dir / 'flutter_complete_demo.lock').open('w')
+
+    def write(self, line):
+        with self.lock:
+            self.logfile.write(line + '\n')
+            self.logfile.flush()
+            try:
+                print(line, flush=True)
+            except BrokenPipeError:
+                self.stop.set()
+
+    def stage(self, phase, message):
+        self.write(PREFIX + json.dumps({'phase': phase, 'message': message,
+                                      'mode': self.mode, 'connection_ready': self.connection_ready}))
+
+    def preflight(self):
+        if os.getpid() not in ProcessTree.snapshot():
+            raise RuntimeError('Cannot verify Linux process ownership. No simulation started.')
+        try:
+            fcntl.flock(self.session_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('A complete Flutter demo is already running.')
+        required = ['start_flutter_world.sh', 'patrol_once.py',
+                    'pose_observation_bridge.py', 'pose_decision_preview.py',
+                    'live_pose_monitor.py', 'config/patrol_waypoints.json',
+                    'models/yolo11n-pose.pt', '.venv_yolo/bin/python']
+        for name in required:
+            if not (self.root / name).is_file():
+                raise RuntimeError('Required file missing: ' + name)
+        targets = {str(self.root / name) for name in (
+            'start_navigation.sh', 'start_flutter_simulation.sh', 'patrol_once.py',
+            'pose_observation_bridge.py', 'pose_decision_preview.py',
+            'live_pose_monitor.py', 'live_robot_pose_monitor.py',
+            'robot_camera_motion_probe.py', 'yolo_person_detector.py')}
+        conflicts = []
+        for path in Path('/proc').glob('[0-9]*/cmdline'):
+            try:
+                args = path.read_bytes().decode(errors='replace').strip('\0').split('\0')
+                gazebo = 'sim' in args and any(Path(arg).name == 'gz' for arg in args)
+                localization = '__node:=lifecycle_manager_localization' in args
+                if targets.intersection(args) or gazebo or localization:
+                    conflicts.append(path.parent.name + ': ' + ' '.join(args[:5]))
+            except OSError:
+                pass
+        if conflicts:
+            raise RuntimeError('Old simulation programs remain. Stop them from their owning app/terminals first. '
+                               + ' | '.join(conflicts))
+        check = socket.socket()
+        try:
+            check.bind(('0.0.0.0', 9090))
+        except OSError:
+            raise RuntimeError('Port 9090 is already occupied. Stop the previous rosbridge before this complete demo.')
+        finally:
+            check.close()
+        config = json.loads((self.root / 'config/patrol_waypoints.json').read_text())
+        if config.get('frame_id') != 'map' or len(config.get('waypoints', [])) != 3:
+            raise RuntimeError('Expected the existing three-point map patrol configuration.')
+        self.route_id = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        self.probe = RosProbe(self)
+        self.write('Session log: ' + str(self.logfile.name))
+
+    def start(self, name, command):
+        if self.stop.is_set():
+            raise Cancelled()
+        if name in self.processes:
+            raise RuntimeError('Process already started: ' + name)
+        environment = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
+                           OPENBLAS_NUM_THREADS='1', PYTHONUNBUFFERED='1')
+        process = subprocess.Popen(command, cwd=self.root, env=environment,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True,
+                                   encoding='utf-8', errors='replace', bufsize=1,
+                                   start_new_session=True)
+        self.processes[name] = process
+        self.trees[name] = ProcessTree()
+        self.trees[name].remember([process.pid])
+        thread = threading.Thread(target=self.read_output, args=(name, process), daemon=True)
+        self.readers.append(thread)
+        thread.start()
+        self.write('[' + name + '] Process started; waiting for readiness.')
+
+    def read_output(self, name, process):
+        for raw in process.stdout:
+            line = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip())
+            with self.lock:
+                markers = {
+                    'observation_armed': ('observation', 'Waiting for a fresh 30-second camera stationary decision.'),
+                    'decision_ready': ('decision', 'Decision preview running.'),
+                    'patrol_goal': ('patrol', 'Patrol leg 1/4:'),
+                    'monitor_ready': ('monitor', 'Publishing /surveillance/pose_activity_preview'),
+                    'standing_trigger': ('observation', 'Fresh camera decision accepted for fixed-person test.'),
+                    'observation_goal': ('observation', 'Observation goal sent.'),
+                    'observation_reached': ('observation', 'Observation point reached.'),
+                    'patrol_resuming': ('observation', 'Automatically resuming interrupted patrol.'),
+                    'mission_complete': ('observation', 'Automatic resumed patrol circuit complete.'),
+                    'no_resume': ('observation', 'No active patrol was interrupted.'),
+                    'patrol_complete': ('patrol', 'Patrol circuit complete.'),
+                }
+                for marker, (expected, text) in markers.items():
+                    if name == expected and text in line:
+                        self.markers.add(marker)
+                if name in ('patrol', 'observation') and '[ERROR]' in line:
+                    self.errors[name] = line
+                # Keep the full process log on disk. GUI suppresses repetitive
+                # window/JSON lines because its Activity tab already shows them.
+                if name == 'monitor' and line.startswith('Collecting a two-second'):
+                    self.logfile.write('[' + name + '] ' + line + '\n')
+                    self.logfile.flush()
+                else:
+                    self.write('[' + name + '] ' + line)
+        process.stdout.close()
+
+    def refresh(self):
+        now = time.monotonic()
+        if now - self.last_tree_refresh < 0.2:
+            return
+        self.last_tree_refresh = now
+        current = ProcessTree.snapshot()
+        for name, tree in self.trees.items():
+            process = self.processes[name]
+            # Never re-adopt a root PID after its original process exited.
+            tree.remember([process.pid] if process.poll() is None else [], current)
+
+    def tick(self, require=()):
+        if self.stop.is_set():
+            raise Cancelled()
+        self.refresh()
+        for name in require:
+            if self.processes[name].poll() is not None:
+                raise RuntimeError(name + ' ended unexpectedly. Read its console output.')
+        with self.lock:
+            for name, message in list(self.errors.items()):
+                observation = self.processes.get('observation')
+                handoff_cancel = (
+                    self.mode == 'standing' and name == 'patrol'
+                    and message.rstrip().endswith('Controller disabled. Patrol cancelled.')
+                    and observation is not None and observation.poll() is None
+                )
+                if handoff_cancel:
+                    if 'standing_trigger' in self.markers:
+                        self.errors.pop(name, None)
+                        continue
+                    # Separate stdout readers may deliver these lines out of order.
+                    first_seen = getattr(self, '_handoff_error_seen', None)
+                    if first_seen is None:
+                        self._handoff_error_seen = time.monotonic()
+                        continue
+                    if time.monotonic() - first_seen < 1.0:
+                        continue
+                raise RuntimeError(message)
+        if self.probe:
+            self.probe.spin()
+        else:
+            self.stop.wait(0.05)
+
+    def wait_navigation(self):
+        until = time.monotonic() + 180
+        last = None
+        ready_since = None
+        while time.monotonic() < until:
+            self.tick(('simulation',))
+            problem = self.probe.ready_problem()
+            if problem is not None:
+                ready_since = None
+                if problem != last:
+                    self.stage('navigation_startup', problem)
+                    last = problem
+            elif ready_since is None:
+                ready_since = time.monotonic()
+            elif time.monotonic() - ready_since >= 1:
+                self.probe.check_parameters()
+                self.stage('navigation_ready', 'Navigation, clock, map, transforms, and camera are ready')
+                return
+        raise RuntimeError('Navigation startup timed out: ' + str(last))
+
+    def wait_connection(self):
+        until = time.monotonic() + 20
+        while time.monotonic() < until:
+            self.tick(('simulation', 'rosbridge'))
+            try:
+                with socket.create_connection(('127.0.0.1', 9090), timeout=0.2):
+                    self.connection_ready = True
+                    return
+            except OSError:
+                pass
+        raise RuntimeError('Rosbridge did not open port 9090.')
+
+    def wait_marker(self, marker, timeout):
+        until = time.monotonic() + timeout
+        while time.monotonic() < until:
+            self.tick(tuple(self.processes))
+            with self.lock:
+                if marker in self.markers:
+                    return
+        raise RuntimeError('Startup timed out while waiting for ' + marker)
+
+    def wait_node(self, name):
+        until = time.monotonic() + 15
+        while time.monotonic() < until:
+            self.tick(tuple(self.processes))
+            if self.probe.node.get_node_names().count(name) == 1:
+                return
+        raise RuntimeError('Expected exactly one ROS node: ' + name)
+
+    def enable_patrol(self):
+        self.patrol_start_clock = self.probe.clock
+        # Mark ownership before the request: cleanup must disable even if the
+        # reply or readback is lost after a successful server-side update.
+        self.controller_owned = True
+        self.probe.enabled(True)
+
+    def check_checkpoint(self, complete):
+        saved = json.loads((self.root / 'config/patrol_progress.json').read_text())
+        stamp = saved.get('simulation_time_ns')
+        if (saved.get('route_id') != self.route_id or type(stamp) is not int
+                or stamp < int(self.patrol_start_clock * 1e9)
+                or stamp > int((self.probe.clock + 0.5) * 1e9)):
+            raise RuntimeError('Patrol checkpoint is stale or does not match this route/session.')
+        if complete and (saved.get('complete') is not True or saved.get('next_index') != 4):
+            raise RuntimeError('Patrol exited before its four-leg circuit completed.')
+        if not complete and saved.get('next_index') != 0:
+            raise RuntimeError('Initial patrol did not save its first leg.')
+
+    def wait_publishers(self):
+        until = time.monotonic() + 15
+        while time.monotonic() < until:
+            self.tick(tuple(self.processes))
+            if all(self.probe.node.count_publishers(topic) == 1 for topic in (
+                    '/surveillance/pose_activity_preview', '/surveillance/pose_decision_preview')):
+                return
+        raise RuntimeError('Expected one pose publisher and one decision publisher.')
+
+    def watch(self, mode):
+        reported = set()
+        patrol_checked = False
+        mission_checked = False
+        while True:
+            self.tick(('simulation', 'rosbridge', 'decision', 'monitor'))
+            if time.monotonic() - self.probe.clock_arrival > 8:
+                raise RuntimeError('Simulation clock stopped. Demo motion has been cancelled.')
+            with self.lock:
+                markers = set(self.markers)
+            for marker, phase, message in (
+                ('standing_trigger', 'standing_trigger', '30-second standing decision accepted; interrupting patrol'),
+                ('observation_goal', 'observing', 'Observation goal sent; moving toward the fixed observation point'),
+                ('observation_reached', 'observation_reached', 'Observation point reached; robot faces the person'),
+                ('patrol_resuming', 'resuming_patrol', 'Resuming the saved patrol leg'),
+            ):
+                if marker in markers and marker not in reported:
+                    self.stage(phase, message)
+                    reported.add(marker)
+            if self.processes['patrol'].poll() is not None and not patrol_checked:
+                # Reader may be draining the final stdout lines after exit.
+                if mode == 'standing' and 'standing_trigger' in markers:
+                    patrol_checked = True
+                elif 'patrol_complete' in markers:
+                    self.check_checkpoint(complete=True)
+                    patrol_checked = True
+                    self.stage('circuit_complete', 'Patrol circuit completed; activity monitoring remains active')
+                else:
+                    # Give the output reader a bounded chance to deliver its
+                    # milestone; errors/checkpoints still determine success.
+                    until = time.monotonic() + 1
+                    while time.monotonic() < until and 'patrol_complete' not in self.markers and 'standing_trigger' not in self.markers:
+                        self.probe.spin()
+                    if 'patrol_complete' not in self.markers and 'standing_trigger' not in self.markers:
+                        raise RuntimeError('Patrol ended without completion or an observation handoff.')
+            if mode == 'standing' and self.processes['observation'].poll() is not None and not mission_checked:
+                until = time.monotonic() + 1
+                while time.monotonic() < until and 'mission_complete' not in self.markers and 'no_resume' not in self.markers:
+                    self.probe.spin()
+                if 'mission_complete' in self.markers:
+                    self.check_checkpoint(complete=True)
+                    self.stage('circuit_complete', 'Observation and resumed patrol circuit completed; activity monitoring remains active')
+                    mission_checked = True
+                else:
+                    raise RuntimeError('Standing mission ended without completing its interrupted patrol.')
+
+    def shutdown(self):
+        if self.shutdown_started:
+            return
+        self.shutdown_started = True
+        self.refresh()
+        if self.controller_owned and self.probe is not None:
+            try:
+                self.probe.enabled(False, allow_stopping=True)
+                self.write('Controller disabled for demo shutdown.')
+            except Exception as error:
+                self.write('Could not confirm controller disable: ' + str(error))
+        # Mission code gets a chance to stop cleanly while controller services
+        # and the simulator are still available.
+        for names in (('observation', 'patrol', 'monitor', 'decision'), ('rosbridge', 'simulation')):
+            trees = [self.trees[name] for name in names if name in self.trees]
+            for sig, duration in ((signal.SIGINT, 12), (signal.SIGTERM, 4), (signal.SIGKILL, 2)):
+                self.refresh()
+                if not any(tree.alive() for tree in trees):
+                    break
+                for tree in trees:
+                    tree.send(sig)
+                until = time.monotonic() + duration
+                while time.monotonic() < until and any(tree.alive() for tree in trees):
+                    self.refresh()
+                    if self.probe:
+                        self.probe.spin()
+                    else:
+                        time.sleep(0.05)
+            if any(tree.alive() for tree in trees):
+                self.write('Some owned processes remain; inspect the session log before restarting.')
+        for process in self.processes.values():
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        for thread in self.readers:
+            thread.join(timeout=1)
+        if self.probe:
+            self.probe.close()
+        self.connection_ready = False
+        self.session_lock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', required=True, choices=('standing', 'walking', 'running'))
+    args = parser.parse_args()
+    host = DemoHost(args.mode)
+    def commands():
+        for line in sys.stdin:
+            if line.strip() == 'stop':
+                break
+        host.stop.set()
+    threading.Thread(target=commands, daemon=True).start()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: host.stop.set())
+    code = 0
+    try:
+        managed_session(host, args.mode)
+    except Cancelled:
+        host.stage('stopped', 'Simulation demo stopped')
+    except Exception as error:
+        code = 1
+        host.stage('error', str(error))
+    finally:
+        host.logfile.close()
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())

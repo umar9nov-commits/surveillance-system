@@ -1,0 +1,29 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.9">
+  <actor name="surveillance_person">
+    <pose>1.93 -1.58 1.0 0 0 0</pose>
+    <skin>
+      <filename>/home/umaryasir/.gz/fuel/fuel.gazebosim.org/mingfei/models/actor/1/meshes/stand.dae</filename>
+      <scale>1.0</scale>
+    </skin>
+    <animation name="standing">
+      <filename>/home/umaryasir/.gz/fuel/fuel.gazebosim.org/mingfei/models/actor/1/meshes/stand.dae</filename>
+      <interpolate_x>false</interpolate_x>
+    </animation>
+    <script>
+      <loop>true</loop>
+      <auto_start>true</auto_start>
+      <delay_start>0</delay_start>
+      <trajectory id="0" type="standing" tension="1">
+        <waypoint>
+          <time>0</time>
+          <pose>0 0 0 0 0 0</pose>
+        </waypoint>
+        <waypoint>
+          <time>5</time>
+          <pose>0 0 0 0 0 0</pose>
+        </waypoint>
+      </trajectory>
+    </script>
+  </actor>
+</sdf>
